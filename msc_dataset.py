@@ -12,9 +12,9 @@ class MSCDataset(Dataset):
 
     """
     def __init__(self, data_path: str, classes: list[str]):
-        self.data = self.unpack_audios_(data_path)
         self.classes = classes
         self.encoded_labels = self.encode_labels_(classes)
+        self.data = self.unpack_audios_(data_path)
 
     def __len__(self):
         return len(self.data)
@@ -35,7 +35,7 @@ class MSCDataset(Dataset):
                 file_path = os.path.join(path,file_name)
                 waveform,sample_rate = torchaudio.load(file_path)
 
-                length = waveform.shape[0]
+                length = waveform.shape[1]
                 if length < target_len:
                     waveform = F.pad(waveform,(0,target_len - length))      #Pad with 0 to 1s * 16KHz = 16000
 
