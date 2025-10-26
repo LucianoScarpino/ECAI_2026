@@ -1,6 +1,7 @@
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 import torchaudio
+import torch
 
 import os
 
@@ -34,6 +35,12 @@ class MSCDataset(Dataset):
                 label = self.label_to_int(file_name.split("_")[0])
                 file_path = os.path.join(path,file_name)
                 waveform,sample_rate = torchaudio.load(file_path)
+                
+                if waveform.dtype != torch.float32:
+                    waveform = waveform.float()
+                if sr != 16000:
+                    waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+                    sr = 16000
 
                 length = waveform.shape[1]
                 if length < target_len:
