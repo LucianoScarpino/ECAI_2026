@@ -34,7 +34,7 @@ class MSCDataset(Dataset):
             if file_name.endswith(".wav"):
                 label = self.label_to_int(file_name.split("_")[0])
                 file_path = os.path.join(path,file_name)
-                waveform,sample_rate = torchaudio.load(file_path)
+                waveform,sr = torchaudio.load(file_path)
                 
                 if waveform.dtype != torch.float32:
                     waveform = waveform.float()
@@ -46,7 +46,7 @@ class MSCDataset(Dataset):
                 if length < target_len:
                     waveform = F.pad(waveform,(0,target_len - length))      #Pad with 0 to 1s * 16KHz = 16000
 
-                audios.append((waveform,sample_rate,label))
+                audios.append((waveform,sr,label))
 
         return audios
     
