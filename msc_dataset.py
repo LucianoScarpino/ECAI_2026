@@ -36,8 +36,6 @@ class MSCDataset(Dataset):
                 file_path = os.path.join(path,file_name)
                 waveform,sr = torchaudio.load(file_path)
                 
-                if waveform.dtype != torch.float32:
-                    waveform = waveform.float()
                 if waveform.shape[0] > 1:
                     waveform = waveform.mean(dim=0, keepdim=True)
                 if sr != 16000:
