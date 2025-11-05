@@ -1,306 +1,160 @@
 import argparse
-import time
-import threading
-import signal
-import sys
+import uuid
 import adafruit_dht
-import board
-import sounddevice as sd
-import numpy as np
-import torchaudio
-import whisper
-import torch
 import redis
+import sounddevice as sd
+import string
 
+import numpy as np
+import torch
+import torchaudio.transforms as T
 
-# CONFIGURATION
+from board import D4
+import whisper 
+from time import time, sleep
 
-REDIS_HOST = 'redis-18284.c135.eu-central-1-1.ec2.redns.redis-cloud.com'
-REDIS_PORT = 18284
-REDIS_USER = "default"
-REDIS_PASSWORD = 'e6vDPMJonRTr4H5PrIIt0v5vNLyschdd'
+# Arguments
+parser = argparse.ArgumentParser(description='Hygrometer Data Logger')
+parser.add_argument('-H', '--host', type=str,
+                    help='Host address for the connection to Redis Cloud database',
+                    default='localhost')
+parser.add_argument('-p', '--port', type=int,
+                    help='Port for the connection to Redis Cloud database')
+parser.add_argument('-u', '--user', type=str,
+                    help='Redis Cloud username')
+parser.add_argument('-pwd', '--password', type=str,
+                    help='Redis Cloud password')
+parser.add_argument('-v', '--verbose', action='store_true', default=False)
+args = parser.parse_args()
 
-#storing temperature and humidity data
-TEMPERATURE_KEY = "temperature:ts"
-HUMIDITY_KEY = "humidity:ts"
+# System Initialization
+mac_address = hex(uuid.getnode())
+dht_device = adafruit_dht.DHT11(D4)
 
-# System configuration
-SENSOR_READ_INTERVAL = 5    # Read sensor every 5 seconds when enabled
-AUDIO_SAMPLE_RATE = 48000   # Microphone sampling rate (48kHz)
-AUDIO_RECORD_TIME = 2.0     # Record 2 seconds of audio for voice commands
-AUDIO_CHANNELS = 1          # Mono audio recording
+redis_client = redis.Redis(
+    host=args.host,
+    port=args.port,
+    username=args.user,
+    password=args.password,
+    decode_responses=False
+)
 
-#pin D4
-DHT_SENSOR_PIN = "D4"
+is_connected = redis_client.ping()
+print(f'Redis Connected: {is_connected}')
 
+if not is_connected:
+    exit("Cannot connect to Redis Cloud database.")
 
-def parse_arguments():
-    """Parse arguments - audio device ID"""
-    parser = argparse.ArgumentParser(description='Voice Controlled Smart Hygrometer')
-    parser.add_argument("--audio-device", 
-                       type=int, 
-                       required=True, 
-                       help="Audio device ID number")
-    return parser.parse_args()
+key_temp = f"{mac_address}:temperature"
+key_hum = f"{mac_address}:humidity"
 
+# Create TimeSeries if they don't exist
+try:
+    redis_client.execute_command('TS.CREATE', key_temp, 'DUPLICATE_POLICY', 'LAST')
+    print(f"Created TimeSeries: {key_temp}")
+except Exception as e:
+    print(f"TimeSeries {key_temp}: {e}")
 
-def print_status(message):
-    """Print status messages immediately with flush"""
-    print(message, flush=True)
+try:
+    redis_client.execute_command('TS.CREATE', key_hum, 'DUPLICATE_POLICY', 'LAST')
+    print(f"Created TimeSeries: {key_hum}")
+except Exception as e:
+    print(f"TimeSeries {key_hum}: {e}")
 
+# Load whisper model directly
+model = whisper.load_model("tiny")
+system_state = False
+resampler = T.Resample(orig_freq=48000, new_freq=16000)
 
-def read_temperature_humidity(sensor):
-    """
-    Read temperature and humidity from DHT11 sensor
-    Returns: (temperature, humidity) or (None, None) if reading fails
-    """
+def process_audio_chunk():
+    """Record and process 1 second of audio for voice commands"""
     try:
-        temperature = sensor.temperature
-        humidity = sensor.humidity
-        return temperature, humidity
-    except Exception:
-        # Sensor read failed, return None values
-        return None, None
-
-
-def setup_redis_database(redis_connection):
-    """Create Redis TimeSeries database structure if it doesn't exist"""
-    try:
-        timeseries = redis_connection.ts()
-        # Create temperature storage with last-value duplicate policy
-        timeseries.create(TEMPERATURE_KEY, retention_msecs=0, duplicate_policy="last")
-        print_status(f"[REDIS] Created {TEMPERATURE_KEY}")
-        # Create humidity storage with same policy
-        timeseries.create(HUMIDITY_KEY, retention_msecs=0, duplicate_policy="last")
-        print_status(f"[REDIS] Created {HUMIDITY_KEY}")
-    except Exception:
-        # Database already exists, no action needed
-        pass
-
-
-def prepare_audio_for_whisper(audio_data, sample_rate):
-    """
-    Process raw audio data for Whisper speech recognition:
-    1. Convert from int16 to float32 in range [-1, 1]
-    2. Convert stereo to mono if needed
-    3. Resample from 48kHz to 16kHz (Whisper requirement)
-    """
-    # Normalize integer audio data to floating point range [-1, 1]
-    audio_float = audio_data.astype(np.float32) / 32768.0
-    
-    # Convert multi-channel audio to mono by averaging channels
-    if audio_float.ndim > 1:
-        audio_float = audio_float.mean(axis=1)
-    
-    # Convert to PyTorch tensor for processing
-    audio_tensor = torch.from_numpy(audio_float).float()
-    
-    # Resample from original rate (48kHz) to Whisper's required 16kHz
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, 
-                                                 new_freq=16000)
-        audio_tensor = resampler(audio_tensor)
-    
-    # Return as numpy array for Whisper
-    return audio_tensor.numpy()
-
-
-def main():
-    # Get audio device ID from command line
-    args = parse_arguments()
-    audio_device_id = args.audio_device
-    
-
-    # INITIALIZE REDIS DATABASE CONNECTION
-
-    
-    # Connect to Redis Cloud database
-    redis_db = redis.Redis(
-        host=REDIS_HOST, 
-        port=REDIS_PORT, 
-        username=REDIS_USER, 
-        password=REDIS_PASSWORD, 
-        decode_responses=True
-    )
-    
-    # Test database connection
-    try:
-        redis_db.ping()
-        print_status("[REDIS] Database connection successful")
-    except Exception as error:
-        print_status(f"[ERROR] Cannot connect to Redis: {error}")
-        sys.exit(1)
-    
-    # Ensure database structure exists
-    setup_redis_database(redis_db)
-    
-    
-    # INITIALIZE DHT11 TEMPERATURE/HUMIDITY SENSOR
-
-    
-    # Get pin and initialize sensor
-    gpio_pin = getattr(board, DHT_SENSOR_PIN)
-    dht_sensor = adafruit_dht.DHT11(gpio_pin)
-    print_status("[SENSOR] DHT11 temperature/humidity sensor ready")
-    
-    
-    # SYSTEM STATE MANAGEMENT
-   
-    
-    # Thread-safe for system control
-    data_collection_active = threading.Event()  # True when collecting data
-    system_shutdown_signal = threading.Event()  # True when shutting down
-   
-    # THREAD 1: SENSOR DATA COLLECTION AND STORAGE
-   
-    
-    def collect_sensor_data():
-        """Continuously read sensor and store data in Redis when enabled"""
-        print_status("[SENSOR] Data collection thread started")
+        # Record 1 second of audio
+        recording = sd.rec(
+            int(1.0 * 48000),
+            samplerate=48000,
+            channels=1,
+            dtype='int16'
+        )
+        sd.wait()
         
-        while not system_shutdown_signal.is_set():
-            if data_collection_active.is_set():
-                # Get current timestamp in milliseconds
-                current_time = int(time.time() * 1000)
-                
-                # Read temperature and humidity from sensor
-                temperature, humidity = read_temperature_humidity(dht_sensor)
-                
-                # Store valid readings in database
-                if temperature is not None and humidity is not None:
-                    try:
-                        timeseries = redis_db.ts()
-                        timeseries.add(TEMPERATURE_KEY, current_time, temperature)
-                        timeseries.add(HUMIDITY_KEY, current_time, humidity)
-                        print_status(f"[DATA] Temperature: {temperature}°C, Humidity: {humidity}%")
-                    except Exception as error:
-                        print_status(f"[DATA ERROR] {error}")
-                
-                # Wait before next reading
-                time.sleep(SENSOR_READ_INTERVAL)
+        audio_data = np.squeeze(recording)
+        audio_data = audio_data.astype(np.float32) / 32768.0
+        
+        # Convert to PyTorch tensor and resample
+        audio_tensor = torch.from_numpy(audio_data).to(torch.float32)
+        resampled_audio = resampler(audio_tensor)
+        processed_audio = resampled_audio.squeeze()
+
+        # Process with Whisper
+        result = model.transcribe(processed_audio.numpy(), fp16=False)
+        cmd = result["text"].strip().translate(
+            str.maketrans('', '', string.punctuation)
+        ).lower()
+        
+        print(f'Recognized: "{cmd}"')
+        
+        # Use partial matching
+        if 'up' in cmd:
+            return True
+        elif 'stop' in cmd:
+            return False
+        
+    except Exception as e:
+        print(f"Error in audio processing: {e}")
+    
+    return None
+
+def store_sensor_data(temperature, humidity):
+    """Store sensor data in Redis TimeSeries"""
+    try:
+        timestamp_ms = int(time() * 1000)  # Current time in milliseconds
+        
+        # Store data using Redis TimeSeries
+        redis_client.execute_command('TS.ADD', key_temp, timestamp_ms, temperature)
+        redis_client.execute_command('TS.ADD', key_hum, timestamp_ms, humidity)
+        
+        print(f"✓ Data stored - Time: {timestamp_ms}, Temp: {temperature}°C, Hum: {humidity}%")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Failed to store data in TimeSeries: {e}")
+        return False
+
+print("Starting system...")
+print("Say 'up' to enable data collection, 'stop' to disable")
+
+# Main loop
+while True:
+    # Process voice commands every 1 second
+    command_result = process_audio_chunk()
+    if command_result is not None:
+        system_state = command_result
+        if system_state:
+            print("*** SYSTEM STATE: ENABLED - Data collection STARTED ***")
+        else:
+            print("*** SYSTEM STATE: DISABLED - Data collection STOPPED ***")
+    
+    # Data collection when enabled
+    if system_state:
+        try:
+            temperature = dht_device.temperature
+            humidity = dht_device.humidity
+            
+            if temperature is not None and humidity is not None:
+                store_sensor_data(temperature, humidity)
             else:
-                # Check every 0.5 seconds if collection should start
-                time.sleep(0.5)
-    
-    # Start sensor data collection thread
-    sensor_thread = threading.Thread(target=collect_sensor_data, daemon=True)
-    sensor_thread.start()
-    
-    
-    # THREAD 2: VOICE COMMAND RECOGNITION
-    
-    
-    def process_voice_commands():
-        """Listen for voice commands and control data collection"""
-        # Configure audio input device
-        sd.default.device = audio_device_id
-        sd.default.samplerate = AUDIO_SAMPLE_RATE
-        sd.default.channels = AUDIO_CHANNELS
-        
-        print_status(f"[AUDIO] Using audio device {audio_device_id}")
-        
-        # Load Whisper speech recognition model
-        print_status("[VOICE] Loading speech recognition model...")
-        speech_model = whisper.load_model("base", device="cpu")
-        print_status("[VOICE] Speech recognition ready")
-        print_status("[VOICE] Listening for 'up' and 'stop' commands...")
-        
-        while not system_shutdown_signal.is_set():
+                print("Failed to read sensor data")
+            
+            sleep(5)
+            
+        except Exception as e:
+            print(f"Sensor error: {e}")
             try:
-                # Record 2 seconds of audio from microphone
-                audio_data = sd.rec(
-                    int(AUDIO_RECORD_TIME * AUDIO_SAMPLE_RATE),
-                    samplerate=AUDIO_SAMPLE_RATE, 
-                    channels=AUDIO_CHANNELS, 
-                    dtype="int16"
-                )
-                # Wait for recording to complete
-                sd.wait()
-                
-                # Process audio for speech recognition
-                audio_array = np.array(audio_data)
-                processed_audio = prepare_audio_for_whisper(audio_array, AUDIO_SAMPLE_RATE)
-                
-                # Convert speech to text using Whisper
-                recognition_result = speech_model.transcribe(
-                    processed_audio, 
-                    language="en", 
-                    fp16=False  # Use 32-bit floats on CPU
-                )
-                
-                # Clean recognized text: lowercase and remove non-alphanumeric
-                recognized_text = recognition_result.get("text", "").lower()
-                clean_text = "".join(char for char in recognized_text if char.isalnum())
-                
-                # Process voice commands
-                if clean_text:
-                    print_status(f"[VOICE] Recognized: '{recognized_text.strip()}' -> '{clean_text}'")
-                    
-                    # Enable data collection on "up" command
-                    if "up" in clean_text:
-                        data_collection_active.set()
-                        print_status("[SYSTEM] Data collection ENABLED")
-                    
-                    # Disable data collection on "stop" command  
-                    elif "stop" in clean_text:
-                        data_collection_active.clear()
-                        print_status("[SYSTEM] Data collection DISABLED")
-                        
-            except Exception as error:
-                print_status(f"[VOICE ERROR] {error}")
-                time.sleep(0.5)
-    
-    # Start voice command processing thread
-    voice_thread = threading.Thread(target=process_voice_commands, daemon=True)
-    voice_thread.start()
-    
-    
-    # SYSTEM STARTUP MESSAGE
-    
-    
-    print_status("\n" + "="*50)
-    print_status("SMART HYGROMETER SYSTEM - READY")
-    print_status(f"Audio Input: Device {audio_device_id}")
-    print_status("Voice Commands Available:")
-    print_status("  Say 'UP' - Start collecting sensor data")
-    print_status("  Say 'STOP' - Stop collecting sensor data")
-    print_status("Press Ctrl+C to shutdown system")
-    print_status("="*50)
-    
-    
-    # SYSTEM SHUTDOWN HANDLING
-    
-    
-    def shutdown_system(signal_number, frame):
-        """Handle Ctrl+C and other shutdown signals"""
-        print_status("\n[SYSTEM] Shutting down...")
-        system_shutdown_signal.set()
-    
-    # Register shutdown signal handlers
-    signal.signal(signal.SIGINT, shutdown_system)
-    signal.signal(signal.SIGTERM, shutdown_system)
-    
- 
-    # MAIN SYSTEM LOOP
-
-    
-    # Keep system running until shutdown signal
-    try:
-        while not system_shutdown_signal.is_set():
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        system_shutdown_signal.set()
-    
-
-    # CLEAN SHUTDOWN
-
-    
-    print_status("[SYSTEM] Waiting for threads to complete...")
-    sensor_thread.join(timeout=2.0)
-    voice_thread.join(timeout=2.0)
-    print_status("[SYSTEM] Shutdown complete")
-
-
-# Start application when script is run directly
-if __name__ == "__main__":
-    main()
+                dht_device.exit()
+            except:
+                pass
+            dht_device = adafruit_dht.DHT11(D4)
+            sleep(1)
+    else:
+        sleep(1)  # Check every 1 second when disabled
