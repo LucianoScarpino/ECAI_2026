@@ -10,35 +10,33 @@ import torch
 import torchaudio.transforms as T
 
 from board import D4
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from scipy.io.wavfile import write
-from time import time
-from datetime import datetime
-
+import whisper 
+from time import time, sleep
 
 # Arguments
-parser = argparse.ArgumentParser(description = 'Hygrometer Data Logger')
-parser.add_argument('-h','--host', type=str, 
+parser = argparse.ArgumentParser(description='Hygrometer Data Logger')
+parser.add_argument('-H', '--host', type=str,
                     help='Host address for the connection to Redis Cloud database',
                     default='localhost')
-parser.add_argument('-p','--port', type=int, 
+parser.add_argument('-p', '--port', type=int,
                     help='Port for the connection to Redis Cloud database')
-parser.add_argument('-u','--user', type=str, 
+parser.add_argument('-u', '--user', type=str,
                     help='Redis Cloud username')
-parser.add_argument('-pwd','--password', type=str, 
+parser.add_argument('-pwd', '--password', type=str,
                     help='Redis Cloud password')
-parser.add_argument('-v', '--verbose', action='store_true',default = False)
+parser.add_argument('-v', '--verbose', action='store_true', default=False)
 args = parser.parse_args()
 
-# System Initilization
+# System Initialization
 mac_address = hex(uuid.getnode())
 dht_device = adafruit_dht.DHT11(D4)
 
 redis_client = redis.Redis(
-    host = args.host,
-    port = args.port,
-    username = args.username,
-    password = args.password
+    host=args.host,
+    port=args.port,
+    username=args.user,
+    password=args.password,
+    decode_responses=False
 )
 
 is_connected = redis_client.ping()
@@ -50,69 +48,124 @@ if not is_connected:
 key_temp = f"{mac_address}:temperature"
 key_hum = f"{mac_address}:humidity"
 
+# Create TimeSeries if they don't exist
 try:
-    redis_client.ts().create(key_temp)
-except redis.ResponseError:
-    pass
+    redis_client.execute_command('TS.CREATE', key_temp, 'DUPLICATE_POLICY', 'LAST')
+    print(f"Created TimeSeries: {key_temp}")
+except Exception as e:
+    print(f"TimeSeries {key_temp}: {e}")
+
 try:
-    redis_client.ts().create(key_hum)
-except redis.ResponseError:
-    pass
+    redis_client.execute_command('TS.CREATE', key_hum, 'DUPLICATE_POLICY', 'LAST')
+    print(f"Created TimeSeries: {key_hum}")
+except Exception as e:
+    print(f"TimeSeries {key_hum}: {e}")
 
-model_name = 'openai/whisper-tiny.en'
-processor = WhisperProcessor.from_pretrained(model_name)
-model = WhisperForConditionalGeneration.from_pretrained(model_name)
-
+# Load whisper model directly
+model = whisper.load_model("tiny")
 system_state = False
+resampler = T.Resample(orig_freq=48000, new_freq=16000)
 
-# Audio acquisition, command recognition and control logic
-def callback(indata,frames,callback_time,status):
-    global system_state
+def process_audio_chunk():
+    """Record and process 1 second of audio for voice commands"""
+    try:
+        # Record 1 second of audio
+        recording = sd.rec(
+            int(1.0 * 48000),
+            samplerate=48000,
+            channels=1,
+            dtype='int16'
+        )
+        sd.wait()
+        
+        audio_data = np.squeeze(recording)
+        audio_data = audio_data.astype(np.float32) / 32768.0
+        
+        # Convert to PyTorch tensor and resample
+        audio_tensor = torch.from_numpy(audio_data).to(torch.float32)
+        # Channel-first as specified by the assignment: shape (channels, samples)
+        audio_tensor_cf = audio_tensor.unsqueeze(0)
+        resampled_audio = resampler(audio_tensor_cf)
+        processed_audio = resampled_audio.squeeze(0)
 
-    indata = indata.T   #channels last --> channel first
-    indata = indata.astype(np.float32)/32768.0  #indata/(2^(16Bit - 1))
-    resampler = T.Resample(orig_freq=48000,new_freq=16000)
-    indata = resampler(indata)
-    indata = np.squeeze(indata) #remove channel dimension
-    input_audio = torch.from_numpy(indata).to(torch.float32)
+        # Process with Whisper
+        result = model.transcribe(processed_audio.numpy(), fp16=False)
+        cmd = result["text"].strip().translate(
+            str.maketrans('', '', string.punctuation)
+        ).lower()
+        cmd = cmd.replace(" ", "")
+        
+        print(f'Recognized: "{cmd}"')
+        
+        # Use partial matching
+        if 'up' in cmd:
+            return True
+        elif 'stop' in cmd:
+            return False
+        
+    except Exception as e:
+        print(f"Error in audio processing: {e}")
+    
+    return None
 
-    input_features = processor(input_audio,
-                                sampling_rate = 16000,
-                                return_tensors = 'pt').input_features
-    predicted_ids = model.generate(input_features)
-    transcription = processor.batch_decode(predicted_ids,
-                                           skip_special_tokens=False)
-    cmd = transcription[0].strip().translate(str.maketrans('', '', string.punctuation)).lower()
-    print(f'Recognized command: {cmd}')
+def store_sensor_data(temperature, humidity):
+    """Store sensor data in Redis TimeSeries"""
+    try:
+        timestamp_ms = int(time() * 1000)  # Current time in milliseconds
+        
+        # Store data using Redis TimeSeries
+        redis_client.execute_command('TS.ADD', key_temp, timestamp_ms, temperature)
+        redis_client.execute_command('TS.ADD', key_hum, timestamp_ms, humidity)
+        
+        print(f"✓ Data stored - Time: {timestamp_ms}, Temp: {temperature}°C, Hum: {humidity}%")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Failed to store data in TimeSeries: {e}")
+        return False
 
-    if cmd == 'up':
-        system_state = True
-    elif cmd == 'stop':
-        system_state = False
+print("Starting system...")
+print("Say 'up' to enable data collection, 'stop' to disable")
 
-channels = 1
-dtype = 'int16'
-samplerate = 48000
-blocksize = 48000  #1 second
-
-with sd.InputStream(channels=channels,
-                    dtype=dtype,
-                    samplerate=samplerate,
-                    blocksize=blocksize,
-                    callback=callback):
-    # Data collection and upload
+# Main loop
+try:
     while True:
-        if system_state == True:
+        # Process voice commands every 1 second
+        command_result = process_audio_chunk()
+        if command_result is not None:
+            system_state = command_result
+            if system_state:
+                print("*** SYSTEM STATE: ENABLED - Data collection STARTED ***")
+            else:
+                print("*** SYSTEM STATE: DISABLED - Data collection STOPPED ***")
+        
+        # Data collection when enabled
+        if system_state:
             try:
-                timestamp = time()
                 temperature = dht_device.temperature
                 humidity = dht_device.humidity
-
-                timestamp = int(timestamp * 1000) #millisecond
-                redis_client.ts().add(key_temp, timestamp, temperature)
-                redis_client.ts().add('humidity', timestamp, humidity)
-
-                time.sleep(5)
-            except:
-                dht_device.exit()
+                
+                if temperature is not None and humidity is not None:
+                    store_sensor_data(temperature, humidity)
+                else:
+                    print("Failed to read sensor data")
+                
+                sleep(5)
+                
+            except Exception as e:
+                print(f"Sensor error: {e}")
+                try:
+                    dht_device.exit()
+                except:
+                    pass
                 dht_device = adafruit_dht.DHT11(D4)
+                sleep(1)
+        else:
+            sleep(1)  # Check every 1 second when disabled
+except KeyboardInterrupt:
+    print("Shutting down...")
+finally:
+    try:
+        dht_device.exit()
+    except Exception:
+        pass
